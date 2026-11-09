@@ -1000,6 +1000,21 @@ static int droid_lkm_nsproxy_hook_install(void)
 	droid_lkm_check_unshare_flags_fn =
 		(int (*)(unsigned long))droid_lkm_sym("check_unshare_flags");
 
+	/*
+	 * a kernel whose fixmap write faults (Xiaomi XRING O1, see KernelSU
+	 * issue #3978) cannot take the slot/data route this hook normally
+	 * takes: create_new_namespaces is a data hook (VC_ROUTE_SLOT) and the
+	 * fixmap alias write faults with -EFAULT before the install lands.
+	 * HK_REDIR_KPROBE arms a hardware breakpoint on the entry instead,
+	 * which the HooKern docs explicitly allow for pages that cannot be
+	 * written at all. the replacement sees the argument registers of the
+	 * target, and hk_redir.orig is the probed entry itself
+	 */
+	if (!droid_lkm_text_patch_ready())
+		return ds_hook_install_kprobe(&droid_lkm_cnn_hook,
+					      "create_new_namespaces",
+					      "droid_lkm_cnn_wrap");
+
 	ret = ds_hook_install_critical(&droid_lkm_cnn_hook,
 					"create_new_namespaces",
 					"droid_lkm_cnn_wrap");
@@ -1196,17 +1211,24 @@ static int droid_lkm_clone_slot_install(void)
 		       (unsigned long)droid_lkm_sys_clone,
 		       (unsigned long *)&droid_lkm_orig_clone);
 	if (ret) {
-		droid_lkm_warn("cannot patch clone slot: %d\n", ret);
-		return ret;
+		/*
+		 * fixmap-faulting kernels (XRING O1) refuse slot writes:
+		 * clone(CLONE_NEWPID|CLONE_NEWIPC) takes the create_new_namespaces
+		 * kprobe/slot hook installed by nsproxy_hook_install
+		 */
+		droid_lkm_warn("clone slot patch unavailable (%d); nsproxy hook covers CLONE_NEWPID|NEWIPC\n",
+			       ret);
+		return 0;
 	}
 
 	ret = droid_lkm_slot_patch(droid_lkm_sys_call_table, __NR_clone3,
 		       (unsigned long)droid_lkm_sys_clone3,
 		       (unsigned long *)&droid_lkm_orig_clone3);
 	if (ret) {
-		droid_lkm_warn("cannot patch clone3 slot: %d\n", ret);
+		droid_lkm_warn("clone3 slot patch unavailable (%d); same nsproxy coverage\n",
+			       ret);
 		droid_lkm_slot_unpatch(droid_lkm_sys_call_table, __NR_clone);
-		return ret;
+		return 0;
 	}
 
 	droid_lkm_info("clone slots patched: clone=%d clone3=%d\n", __NR_clone,
@@ -1216,7 +1238,18 @@ static int droid_lkm_clone_slot_install(void)
 
 static int droid_lkm_copy_namespaces_hook_install(void)
 {
-	int ret = ds_hook_install_critical(&droid_lkm_cn_hook,
+	int ret;
+
+	/*
+	 * same fixmap-faulting case as create_new_namespaces: take the kprobe
+	 * route when the kernel patch path is unavailable
+	 */
+	if (!droid_lkm_text_patch_ready())
+		return ds_hook_install_kprobe(&droid_lkm_cn_hook,
+					      "copy_namespaces",
+					      "droid_lkm_cn_wrap");
+
+	ret = ds_hook_install_critical(&droid_lkm_cn_hook,
 					   "copy_namespaces",
 					   "droid_lkm_cn_wrap");
 
@@ -1273,17 +1306,30 @@ int droid_lkm_slot_init(void)
 		       (unsigned long)droid_lkm_sys_unshare,
 		       (unsigned long *)&droid_lkm_orig_unshare);
 	if (ret) {
-		droid_lkm_err("cannot patch unshare slot: %d\n", ret);
-		goto err_sc;
+		/*
+		 * a fixmap-faulting kernel (Xiaomi XRING O1, see KernelSU#3978)
+		 * refuses slot writes: the namespace isolation stays alive
+		 * through the nsproxy kprobe hook installed below. legacy
+		 * unshare(2) keeps its kernel path; create_new_namespaces is
+		 * still wrapped, which is what clone(2)/clone3(2) and the
+		 * kernel-internal unshare reach
+		 */
+		droid_lkm_warn("unshare slot patch unavailable (%d), nsproxy route carries CLONE_NEWPID|NEWIPC\n",
+			       ret);
+		ret = 0;
 	}
 
 	ret = droid_lkm_slot_patch(droid_lkm_sys_call_table, __NR_reboot,
 		       (unsigned long)droid_lkm_sys_reboot,
 		       (unsigned long *)&droid_lkm_orig_reboot);
 	if (ret) {
-		droid_lkm_err("cannot patch reboot slot: %d\n", ret);
-		droid_lkm_slot_unpatch(droid_lkm_sys_call_table, __NR_unshare);
-		goto err_sc;
+		/*
+		 * container reboot is an enhancement; the host reboot path
+		 * is untouched by the module either way
+		 */
+		droid_lkm_warn("reboot slot patch unavailable (%d), container reboot falls back to SIGKILL\n",
+			       ret);
+		ret = 0;
 	}
 
 	ret = droid_lkm_slot_patch_ipc();
