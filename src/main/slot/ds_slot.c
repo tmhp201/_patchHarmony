@@ -1354,10 +1354,6 @@ int droid_lkm_slot_init(void)
 	droid_lkm_info("syscall slots patched: unshare=%d reboot=%d\n", __NR_unshare,
 		__NR_reboot);
 	return 0;
-
-err_sc:
-	sc_exit();
-	return ret;
 }
 
 void droid_lkm_slot_exit(void)
